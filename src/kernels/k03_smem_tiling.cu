@@ -1,33 +1,9 @@
 // Kernel 3: shared memory tiling.
 //
-// Kernel 2 still reads every A and B element from global memory K times over
-// across the block. Global memory is slow (hundreds of cycles). Shared memory
-// is on-chip and fast (a few cycles) but small (48 KB default per block).
-//
-// Idea: each block computes a BLOCKSIZE x BLOCKSIZE tile of C. Loop over K in
-// chunks of BLOCKSIZE. For each chunk, cooperatively load a BLOCKSIZE x BLOCKSIZE
-// tile of A and of B into shared memory, __syncthreads(), do the partial dot
-// products from shared memory, __syncthreads(), advance.
-//
-// Every global element is now loaded once per block instead of once per thread.
-//
-// Expected gain: maybe 1.5 to 2x over kernel 2. Less than you'd hope, which is
-// the interesting part. Profile it and figure out why (hint: arithmetic
-// intensity per thread is still low, each thread does one FMA per two smem
-// loads). That's what kernel 4 fixes.
-//
-// TODO:
-//   1. __shared__ float As[BLOCKSIZE * BLOCKSIZE]; same for Bs.
-//   2. Advance A, B, C pointers to this block's starting tile.
-//   3. for (bk = 0; bk < K; bk += BLOCKSIZE):
-//        load As[threadRow*BLOCKSIZE + threadCol] = A[threadRow*K + threadCol]
-//        load Bs[...] = B[threadRow*N + threadCol]
-//        __syncthreads()
-//        A += BLOCKSIZE; B += BLOCKSIZE * N;
-//        for (i = 0; i < BLOCKSIZE; i++) acc += As[threadRow*BLOCKSIZE+i] * Bs[i*BLOCKSIZE+threadCol]
-//        __syncthreads()
-//   4. Write C.
-//   Assumes M, N, K are multiples of BLOCKSIZE. All benchmark sizes are.
+// Each block computes a 32x32 tile of C. Instead of every thread reading its
+// own row of A and column of B from global memory, the block cooperatively
+// loads a 32x32 tile of A and of B into shared memory (fast, on-chip), all
+// threads compute from that, then the tiles slide along K.
 
 #include "kernels.cuh"
 
@@ -35,10 +11,49 @@
 
 __global__ void sgemm_smem(int M, int N, int K, float alpha, const float* A,
                            const float* B, float beta, float* C) {
-  // TODO
+  // Fast on-chip scratchpad, shared by all 1024 threads in this block.
+  __shared__ float As[BLOCKSIZE * BLOCKSIZE];
+  __shared__ float Bs[BLOCKSIZE * BLOCKSIZE];
+
+  // My position inside the 32x32 block.
+  const int threadRow = threadIdx.x / BLOCKSIZE;
+  const int threadCol = threadIdx.x % BLOCKSIZE;
+
+  // Move the pointers to the top-left corner of this block's tile.
+  A += blockIdx.x * BLOCKSIZE * K;
+  B += blockIdx.y * BLOCKSIZE;
+  C += blockIdx.x * BLOCKSIZE * N + blockIdx.y * BLOCKSIZE;
+
+  float acc = 0.0f;
+
+  for (int bk = 0; bk < K; bk += BLOCKSIZE) {
+    // Every thread loads exactly one element of each tile.
+    As[threadRow * BLOCKSIZE + threadCol] = A[threadRow * K + threadCol];
+    Bs[threadRow * BLOCKSIZE + threadCol] = B[threadRow * N + threadCol];
+
+    // Wait for all 1024 loads to finish before anyone reads the tile.
+    __syncthreads();
+
+    // Slide to the next tile along K.
+    A += BLOCKSIZE;
+    B += BLOCKSIZE * N;
+
+    // Dot product across the tile, from fast memory.
+    for (int i = 0; i < BLOCKSIZE; ++i) {
+      acc += As[threadRow * BLOCKSIZE + i] * Bs[i * BLOCKSIZE + threadCol];
+    }
+
+    // Wait until everyone is done reading before the next load overwrites it.
+    __syncthreads();
+  }
+
+  C[threadRow * N + threadCol] = alpha * acc + beta * C[threadRow * N + threadCol];
 }
 
 bool run_k03_smem_tiling(int M, int N, int K, float alpha, const float* A,
                          const float* B, float beta, float* C) {
-  return false;
+  dim3 block(BLOCKSIZE * BLOCKSIZE);
+  dim3 grid(ceil_div(M, BLOCKSIZE), ceil_div(N, BLOCKSIZE));
+  sgemm_smem<<<grid, block>>>(M, N, K, alpha, A, B, beta, C);
+  return true;
 }
