@@ -1,35 +1,70 @@
-// Kernel 4: 1D block tiling (each thread computes several outputs).
+// Kernel 4: 1D block tiling. Each thread computes TM=8 outputs in a column.
 //
-// In kernel 3 each thread computes ONE output element, so per inner-loop step
-// it does 2 shared-memory loads and 1 FMA. Shared memory bandwidth becomes the
-// bottleneck. Fix: make each thread compute TM outputs in a column. Now per
-// step it loads 1 element of B from smem, and TM elements of A, and does TM
-// FMAs. Ratio improves from 2 loads/FMA toward 1 load/FMA.
-//
-// Typical params from the reference roadmap: BM=64, BN=64, BK=8, TM=8.
-// Block has (BM*BN)/TM = 512 threads. Each thread owns an 8x1 strip of C.
-//
-// Expected gain: 2 to 3x over kernel 3. You should now be at roughly 30 to 40%
-// of cuBLAS.
-//
-// TODO:
-//   1. Templated or #define'd BM, BN, BK, TM.
-//   2. Cooperative load of a BM x BK tile of A and BK x BN tile of B into smem
-//      (each thread loads one element of each; think about the index math).
-//   3. float threadResults[TM] = {0};
-//   4. for each dotIdx in BK: cache Bs[dotIdx*BN + threadCol] in a register,
-//      then for resIdx in TM: threadResults[resIdx] += As[(threadRow*TM+resIdx)*BK + dotIdx] * that register
-//   5. Write TM results to C.
+// Block tile: BM x BN = 64x64 outputs. K is walked in chunks of BK=8.
+// 512 threads per block, each owning an 8x1 strip of C.
+// Per inner step a thread loads 1 value of B into a register and reuses it
+// for 8 FMAs, so the load:FMA ratio drops from 2:1 (kernel 3) to about 9:8.
 
 #include "kernels.cuh"
+
+#define BM 64
+#define BN 64
+#define BK 8
+#define TM 8
 
 __global__ void sgemm_1d_blocktiling(int M, int N, int K, float alpha,
                                      const float* A, const float* B,
                                      float beta, float* C) {
-  // TODO
+  __shared__ float As[BM * BK];   // 64 rows x 8 cols of A
+  __shared__ float Bs[BK * BN];   // 8 rows x 64 cols of B
+
+  // Which 64x64 tile of C this block owns.
+  A += blockIdx.x * BM * K;
+  B += blockIdx.y * BN;
+  C += blockIdx.x * BM * N + blockIdx.y * BN;
+
+  // My column within the tile (0..63), and which 8-row strip I own (0..7).
+  const int threadCol = threadIdx.x % BN;
+  const int threadRow = threadIdx.x / BN;
+
+  // Which element I load when we fill the tiles. A's tile is 64x8 = 512
+  // elements, B's is 8x64 = 512, one per thread. The A mapping puts
+  // consecutive threads on consecutive columns so the global load coalesces.
+  const int innerColA = threadIdx.x % BK;
+  const int innerRowA = threadIdx.x / BK;
+  const int innerColB = threadIdx.x % BN;
+  const int innerRowB = threadIdx.x / BN;
+
+  float threadResults[TM] = {0.0f};   // 8 accumulators in registers
+
+  for (int bk = 0; bk < K; bk += BK) {
+    As[innerRowA * BK + innerColA] = A[innerRowA * K + innerColA];
+    Bs[innerRowB * BN + innerColB] = B[innerRowB * N + innerColB];
+    __syncthreads();
+
+    A += BK;
+    B += BK * N;
+
+    for (int dotIdx = 0; dotIdx < BK; ++dotIdx) {
+      const float tmpB = Bs[dotIdx * BN + threadCol];   // load B once...
+      for (int resIdx = 0; resIdx < TM; ++resIdx) {     // ...reuse it 8 times
+        threadResults[resIdx] +=
+            As[(threadRow * TM + resIdx) * BK + dotIdx] * tmpB;
+      }
+    }
+    __syncthreads();
+  }
+
+  for (int resIdx = 0; resIdx < TM; ++resIdx) {
+    const int r = threadRow * TM + resIdx;
+    C[r * N + threadCol] = alpha * threadResults[resIdx] + beta * C[r * N + threadCol];
+  }
 }
 
 bool run_k04_1d_blocktiling(int M, int N, int K, float alpha, const float* A,
                             const float* B, float beta, float* C) {
-  return false;
+  dim3 block((BM * BN) / TM);   // 512 threads
+  dim3 grid(ceil_div(M, BM), ceil_div(N, BN));
+  sgemm_1d_blocktiling<<<grid, block>>>(M, N, K, alpha, A, B, beta, C);
+  return true;
 }
