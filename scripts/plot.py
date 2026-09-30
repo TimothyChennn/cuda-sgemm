@@ -67,25 +67,6 @@ plt.legend()
 plt.tight_layout()
 plt.savefig(f"results/pct_cublas_{largest}.png", dpi=150)
 
-# 3. Roofline. SGEMM arithmetic intensity for square N (no reuse assumed):
-#    2N^3 flops / (3 * N^2 * 4 bytes) = N/6 flop/byte. Real kernels reuse
-#    data, so this is the naive lower bound on intensity; the plot still shows
-#    how far each kernel sits from compute peak.
-peak = args.peak_tflops * 1e3
-bw = args.bandwidth_gbs
-ai = np.logspace(-1, 3, 200)
-roof = np.minimum(peak, ai * bw)
-plt.figure(figsize=(8, 5))
-plt.loglog(ai, roof, color="black", label="roofline")
-for k in kernels:
-    if largest in by_kernel[k]:
-        g = float(by_kernel[k][largest]["gflops"])
-        plt.scatter([largest / 6], [g], label=k, zorder=3)
-plt.xlabel("arithmetic intensity (FLOP/byte, lower bound)")
-plt.ylabel("GFLOPS")
-plt.title(f"Roofline, {gpu} ({args.peak_tflops} TFLOPS fp32, {args.bandwidth_gbs} GB/s)")
-plt.grid(alpha=0.3, which="both")
-plt.legend(fontsize=8)
-plt.tight_layout()
-plt.savefig("results/roofline.png", dpi=150)
-print("wrote results/gflops_vs_size.png, pct_cublas png, roofline.png")
+# No roofline here on purpose: a meaningful roofline needs measured DRAM
+# traffic per kernel (Nsight Compute), not the theoretical intensity.
+print("wrote results/gflops_vs_size.png and the pct_cublas png")
